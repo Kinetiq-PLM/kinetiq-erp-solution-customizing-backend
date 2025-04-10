@@ -147,7 +147,7 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 AI_CONFIG = {
     "model": "gemini-2.0-flash",
-    "api_key": "AIzaSyBV9MSvQI-nBmfKlTl693KsLLSQVuNKKsM"
+    "api_key": ""
 }
 
 DATABASE_SCHEMA = """ 
