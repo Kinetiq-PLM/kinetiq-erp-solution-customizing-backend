@@ -1,3 +1,9 @@
-# kinetiq-erp-solution-customizing-backend
+## kinetiq-erp-solution-customizing-backend
 
-needs Gemini API key in solution-customizing-backend/settings.py
+
+Before running Django project
+```
+pip install langchain langchain_core langchain_google_genai psycopg2
+```
+
+- Currently needs manual addition of Gemini API key in solution-customizing-backend/settings.py
