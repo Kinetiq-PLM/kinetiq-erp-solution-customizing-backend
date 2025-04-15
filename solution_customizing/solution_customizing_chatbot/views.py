@@ -1,13 +1,10 @@
 from django.shortcuts import render
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
-from google import genai
-import google.generativeai as genai
 from django.conf import settings
 from .utils import (
-    connect_to_postgres, execute_query, 
-    analyze_response, generate_ai_prompt, 
-    process_ai_response
+    connect_to_postgres, execute_query, get_database_schema,
+    setup_langchain_agent, process_user_input, analyze_sql_results
 )
 
 # Initialize AI client
@@ -19,30 +16,28 @@ def chatbot(request):
         user_input = request.GET.get('message', '')
     else:
         return JsonResponse({"error": "Only GET requests are supported"}, status=400)
-    
-    genai.configure(api_key=settings.AI_CONFIG["api_key"])
-    models = genai.GenerativeModel(settings.AI_CONFIG["model"])
-    
-    
-    # Generate AI response
-    response = models.generate_content(
-        contents=generate_ai_prompt(settings.DATABASE_SCHEMA, user_input)
-    )
-    
-    # Process response
-    json_response = process_ai_response(response.text)
-    # Handle different intents
+
+    # Connect and get schema
+    connection = connect_to_postgres()
+    if not connection:
+        return JsonResponse({"error": "Database connection failed"}, status=500)
+    db_schema = get_database_schema(connection)
+    connection.close()
+
+    # Set up LangChain agent (could be cached for performance)
+    chain = setup_langchain_agent()
+    json_response = process_user_input(user_input, chain, db_schema)
     final_response = {"response": json_response["answer"]}
-    
+
     # Execute SQL query if present
-    if json_response["sql_query"] != "None":
-        connection = connect_to_postgres()              # this runs
+    if json_response.get("sql_query") and json_response["sql_query"] not in [None, "None"]:
+        connection = connect_to_postgres()
         if connection:
             try:
-                result = execute_query(connection, json_response["sql_query"])          # sql execute
-                # Add analysis if generate_sql intent
+                result = execute_query(connection, json_response["sql_query"])
                 if json_response["intent"] == "generate_sql" and result:
-                    analysis = analyze_response(result, user_input, models)
+                    # Optionally analyze result
+                    analysis = analyze_sql_results(result, user_input, chain)
                     final_response["response"] = analysis
                     final_response["data"] = result
                 connection.close()
