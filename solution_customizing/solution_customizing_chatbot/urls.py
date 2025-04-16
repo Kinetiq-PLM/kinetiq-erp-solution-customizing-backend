@@ -3,16 +3,18 @@ from .views import (
     conversation_list_by_user,
     archive_conversation,
     create_conversation,
-    message_list,
-    handle_user_message,
+    load_messages,
+    create_message,
     chatbot,
+    get_database_info,
 )
 
 urlpatterns = [
-    path('conversations/user/<str:user_id>/', conversation_list_by_user, name='conversation_list_by_user'),
-    path('conversations/<str:conversation_id>/', archive_conversation, name='archive_conversation'),
-    path('conversations/', create_conversation, name='create_conversation'),
-    path('messages/<str:conversation_id>/', message_list, name='message_list'),
-    path('messages/user/<str:user_id>/', handle_user_message, name='handle_user_message'),
+    path('load_conversations/<str:user_id>/', conversation_list_by_user, name='load_conversations'), # WORKS
+    path('load_messages/<str:conversation_id>/', load_messages, name='load_messages'),
+    path('archive_conversation/<str:conversation_id>/', archive_conversation, name='archive_conversation'),
+    path('create_conversation/', create_conversation, name='create_conversation'),   # Requires user_id
+    path('create_message/<str:conversation_id>/', create_message, name='create_message'),
+    path('database-schema/', get_database_info, name='database-schema'),
     path('chatbot/', chatbot, name='chatbot'),
 ]

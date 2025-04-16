@@ -3,6 +3,7 @@ import psycopg2
 from datetime import datetime, date
 from decimal import Decimal
 from django.conf import settings
+from django.db import connection
 
 # LangChain imports
 from langchain_core.prompts import ChatPromptTemplate
@@ -218,3 +219,113 @@ def analyze_sql_results(results, user_input, chain_wrapper):
                 .removeprefix("'''")
                 .removesuffix("```")
                 .removesuffix("'''"))
+    
+def get_kinetiq_database_schema():
+    """Get complete schema information for Kinetiq database."""
+    schema_info = {}
+    
+    with connection.cursor() as cursor:
+        # Get all schemas except system schemas
+        cursor.execute("""
+            SELECT schema_name 
+            FROM information_schema.schemata 
+            WHERE schema_name NOT IN 
+                ('pg_catalog', 'information_schema', 'pg_toast')
+            ORDER BY schema_name;
+        """)
+        schemas = cursor.fetchall()
+        
+        for schema in schemas:
+            schema_name = schema[0]
+            schema_info[schema_name] = {}
+            
+            # Get all tables for current schema
+            cursor.execute("""
+                SELECT 
+                    table_name,
+                    table_type
+                FROM information_schema.tables 
+                WHERE table_schema = %s
+                ORDER BY table_name;
+            """, [schema_name])
+            tables = cursor.fetchall()
+            
+            for table in tables:
+                table_name = table[0]
+                schema_info[schema_name][table_name] = {
+                    'columns': [],
+                    'foreign_keys': [],
+                    'primary_key': None
+                }
+                
+                # Get column information
+                cursor.execute("""
+                    SELECT 
+                        column_name,
+                        data_type,
+                        character_maximum_length,
+                        column_default,
+                        is_nullable
+                    FROM information_schema.columns
+                    WHERE table_schema = %s
+                    AND table_name = %s
+                    ORDER BY ordinal_position;
+                """, [schema_name, table_name])
+                columns = cursor.fetchall()
+                
+                for column in columns:
+                    schema_info[schema_name][table_name]['columns'].append({
+                        'name': column[0],
+                        'type': column[1],
+                        'max_length': column[2],
+                        'default': column[3],
+                        'nullable': column[4] == 'YES'
+                    })
+                
+                # Get primary key information
+                cursor.execute("""
+                    SELECT c.column_name
+                    FROM information_schema.table_constraints tc
+                    JOIN information_schema.constraint_column_usage AS ccu 
+                    USING (constraint_schema, constraint_name)
+                    JOIN information_schema.columns AS c 
+                    ON c.table_schema = tc.constraint_schema
+                    AND c.table_name = tc.table_name
+                    AND c.column_name = ccu.column_name
+                    WHERE constraint_type = 'PRIMARY KEY'
+                    AND tc.table_schema = %s
+                    AND tc.table_name = %s;
+                """, [schema_name, table_name])
+                pk = cursor.fetchone()
+                if pk:
+                    schema_info[schema_name][table_name]['primary_key'] = pk[0]
+                
+                # Get foreign key information
+                cursor.execute("""
+                    SELECT
+                        kcu.column_name,
+                        ccu.table_schema AS foreign_table_schema,
+                        ccu.table_name AS foreign_table_name,
+                        ccu.column_name AS foreign_column_name
+                    FROM information_schema.table_constraints AS tc
+                    JOIN information_schema.key_column_usage AS kcu
+                    ON tc.constraint_name = kcu.constraint_name
+                    AND tc.table_schema = kcu.table_schema
+                    JOIN information_schema.constraint_column_usage AS ccu
+                    ON ccu.constraint_name = tc.constraint_name
+                    AND ccu.table_schema = tc.table_schema
+                    WHERE tc.constraint_type = 'FOREIGN KEY'
+                    AND tc.table_schema = %s
+                    AND tc.table_name = %s;
+                """, [schema_name, table_name])
+                foreign_keys = cursor.fetchall()
+                
+                for fk in foreign_keys:
+                    schema_info[schema_name][table_name]['foreign_keys'].append({
+                        'column': fk[0],
+                        'references_schema': fk[1],
+                        'references_table': fk[2],
+                        'references_column': fk[3]
+                    })
+    
+    return schema_info
