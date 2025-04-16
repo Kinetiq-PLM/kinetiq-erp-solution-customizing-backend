@@ -214,23 +214,26 @@ def create_message(request, conversation_id):
             # created_at is likely auto_now_add=True in the model
         )
 
+        # --- Update Conversation Timestamp ---
+        # Set the conversation's updated_at to the current time
+        conversation.updated_at = datetime.now() # Use timezone.now() for timezone awareness
+        conversation.save(update_fields=['updated_at']) # Efficiently save only the updated field
+        # --- End Update ---
+
+
         # Serialize the new message object for the response
-        # Exclude fields if necessary, format dates
         response_data = model_to_dict(new_message)
-        # Ensure related fields like conversation_id are properly represented
         response_data['conversation_id'] = str(new_message.conversation.conversation_id)
-        # Format datetime if needed (model_to_dict might handle it)
         if 'created_at' in response_data and hasattr(response_data['created_at'], 'isoformat'):
             response_data['created_at'] = response_data['created_at'].isoformat()
 
         return JsonResponse(response_data, status=201)
 
     except ValidationError as e:
-         # Catch validation errors from the model
          return JsonResponse({"error": e.message_dict}, status=400)
     except Exception as e:
-        # Catch other potential errors (database errors, etc.)
-        # Log the error for debugging: import logging; logging.error(f"Error creating message: {e}")
+        # Log the error for debugging
+        print(f"Error creating message or updating conversation: {e}") 
         return JsonResponse({"error": f"Failed to create message: {str(e)}"}, status=500)
 
 
