@@ -182,7 +182,9 @@ def process_user_input(user_input, chain, db_schema):
             "answer": f"Your input exceeds the maximum length of {MAX_INPUT_LENGTH} characters. Please shorten your message.",
             "sql_query": None
         }
-    enhanced_input = f"Database schema: {json.dumps(db_schema)}\n\nUser query: {user_input}"
+    # enhanced_input = f"Database schema: {json.dumps(db_schema)}\n\nUser query: {user_input}"
+    enhanced_input = f"User query: {user_input}"
+    
     try:
         response = chain(enhanced_input)
         clean_text = (response.strip()

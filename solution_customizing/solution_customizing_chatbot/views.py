@@ -1,4 +1,5 @@
 from django.forms import model_to_dict
+from django.utils import timezone
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from pydantic import ValidationError
@@ -6,11 +7,36 @@ from rest_framework.decorators import api_view
 import json
 from datetime import datetime
 
-from .models import Conversation, Message
+from .models import Conversation, Message, User
 from .utils import (
     connect_to_postgres, execute_query,
-    setup_langchain_agent, process_user_input, analyze_sql_results, get_kinetiq_database_schema
+    setup_langchain_agent, process_user_input, analyze_sql_results,
+    get_kinetiq_database_schema
 )
+
+
+@api_view(['GET'])
+def get_user_details(request, user_id):
+    """Fetch user details by user_id."""
+    try:
+        user = User.objects.get(user_id=user_id)
+        # Return only the necessary fields
+        user_data = {
+            'user_id': user.user_id,
+            'employee_id': user.employee_id,
+            'first_name': user.first_name,
+            'last_name': user.last_name,
+            # Add other fields if needed, e.g., role
+            # 'role_id': user.role.role_id if user.role else None
+        }
+        return JsonResponse(user_data, status=200)
+    except User.DoesNotExist:
+        return JsonResponse({"error": "User not found"}, status=404)
+    except Exception as e:
+        # Log the error e
+        print(f"Error fetching user details: {e}")
+        return JsonResponse({"error": f"Failed to fetch user details: {str(e)}"}, status=500)
+
 
 # Conversation views
 @api_view(['GET'])
@@ -45,17 +71,25 @@ def create_conversation(request):
         - is_archived (optional, defaults to False)
     """
     data = request.data
-    if not data.get('user_id'):
+    user_id_str = data.get('user_id')
+    if not user_id_str:
         return JsonResponse({"error": "user_id is required"}, status=400)
 
     try:
+        try:
+            user_instance = User.objects.get(user_id=user_id_str)
+            print(f"User found: {user_instance}") # Debugging line to check user retrieval
+        except User.DoesNotExist:
+            # Handle case where the user ID doesn't exist
+            return JsonResponse({"error": f"User with id '{user_id_str}' not found"}, status=404)
+        
         # Get the current time
-        now = datetime.now()
+        now = timezone.now()
         
         conversation = Conversation.objects.create(
             # Use uuid.uuid4() directly if conversation_id is a UUIDField
             role_id=data.get('role_id'),
-            user_id=data.get('user_id'),
+            user_id=user_instance,
             # Explicitly set started_at and updated_at to the current time
             started_at=now,
             updated_at=now
@@ -65,8 +99,8 @@ def create_conversation(request):
         # Prepare the response data including the timestamps
         response = {
             "conversation_id": conversation.conversation_id,
-            "role_id": conversation.role_id,
-            "user_id": conversation.user_id,
+            "role_id": conversation.role_id.role_id if conversation.role_id else None,
+            "user_id": conversation.user_id.user_id,
             "started_at": conversation.started_at.isoformat(), # Format for JSON
             "updated_at": conversation.updated_at.isoformat(), # Format for JSON
             "is_archived": conversation.is_archived,
@@ -86,13 +120,13 @@ def archive_conversation(request, conversation_id):
     try:
         conversation = Conversation.objects.get(conversation_id=conversation_id)
         conversation.is_archived = True
-        conversation.updated_at = datetime.now()
-        conversation.save()
+        conversation.updated_at = timezone.now()
+        conversation.save(update_fields=['is_archived', 'updated_at'])
 
         response = {
             "conversation_id": conversation.conversation_id,
-            "role_id": conversation.role_id,
-            "user_id": conversation.user_id,
+            "role_id": conversation.role_id.role_id if conversation.role_id else None,
+            "user_id": conversation.user_id.user_id if conversation.user_id else None,
             "started_at": conversation.started_at,
             "updated_at": conversation.updated_at,
             "is_archived": conversation.is_archived,
@@ -104,6 +138,7 @@ def archive_conversation(request, conversation_id):
     except Conversation.DoesNotExist:
         return JsonResponse({"error": "Conversation not found"}, status=404)
     except Exception as e:
+        print(f"Error archiving conversation: {e}")
         return JsonResponse(
             {"error": f"Failed to archive conversation: {str(e)}"}, 
             status=500
@@ -250,8 +285,8 @@ def chatbot(request):
 
     try:
         # Get the comprehensive schema using the utility function
-        db_schema = get_kinetiq_database_schema()
-
+        # db_schema = get_kinetiq_database_schema()
+        db_schema = {}
         # Set up LangChain agent (could be cached for performance)
         chain = setup_langchain_agent() # Assuming this function doesn't need a connection object
         json_response = process_user_input(user_input, chain, db_schema)
@@ -295,7 +330,8 @@ def chatbot(request):
 def get_database_info(request):
     """Endpoint to get complete database schema information."""
     try:
-        schema_info = get_kinetiq_database_schema()
+        # schema_info = get_kinetiq_database_schema()
+        schema_info = {}
         return JsonResponse({
             'status': 'success',
             'schema': schema_info

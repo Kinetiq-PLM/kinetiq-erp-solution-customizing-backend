@@ -2,6 +2,43 @@ from django.utils import timezone
 from django.db import models
 import uuid
 
+class RolePerm(models.Model):
+    role_id = models.CharField(primary_key=True, max_length=255)    
+    role_name = models.CharField(max_length=255)
+    description = models.TextField(null=True, blank=True)
+    permissions = models.TextField(null=True, blank=True)
+
+    def __str__(self):
+        return self.role_name
+    
+    class Meta:
+        db_table = '"admin"."roles_permission"'
+        managed = False
+
+class User(models.Model):
+    ACTIVE = 'Active'
+    INACTIVE = 'Inactive'
+
+    STATUS_CHOICES = [
+        (ACTIVE, 'Active'),
+        (INACTIVE, 'Inactive'),
+    ]
+    user_id = models.CharField(primary_key=True, max_length=255)
+    employee_id = models.CharField(max_length=255, null=True, blank=True)
+    first_name = models.CharField(max_length=255)
+    last_name = models.CharField(max_length=255)
+    role = models.ForeignKey(RolePerm, on_delete=models.SET_NULL, null=True, blank=True, to_field='role_id', db_column='role_id')
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=ACTIVE)
+
+    def __str__(self):
+        return f"{self.first_name} {self.last_name}"
+    
+    class Meta:
+        db_table = '"admin"."users"'
+        verbose_name = 'User'
+        verbose_name_plural = 'Users'
+        managed = False
+
 class Conversation(models.Model):
     def generate_convo_id():
         return f"convo_{uuid.uuid4().hex}"
@@ -12,8 +49,9 @@ class Conversation(models.Model):
         default=generate_convo_id,
         editable=False
     )
-    role_id = models.CharField(max_length=255, null=True, blank=True)
-    user_id = models.CharField(max_length=255, null=True, blank=True)
+    
+    role_id = models.ForeignKey(RolePerm, on_delete=models.SET_NULL, null=True, blank=True, to_field='role_id', db_column='role_id')
+    user_id = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, to_field='user_id', db_column='user_id')
     started_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(null=True, blank=True)
     is_archived = models.BooleanField(default=False)
@@ -30,8 +68,8 @@ class Conversation(models.Model):
         super().delete(*args, **kwargs)
 
     class Meta:
-        
         db_table = '"solution_customizing"."conversations"'
+        managed = False
 
 
 class Message(models.Model):
@@ -64,3 +102,4 @@ class Message(models.Model):
 
     class Meta:
         db_table = '"solution_customizing"."messages"'
+        managed = False
