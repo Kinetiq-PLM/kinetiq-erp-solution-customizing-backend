@@ -11,15 +11,16 @@ from .models import Conversation, Message, User
 from .utils import (
     connect_to_postgres, execute_query,
     setup_langchain_agent, process_user_input, analyze_sql_results,
+    title_generation_chain,
     get_kinetiq_database_schema
 )
 
 
 @api_view(['GET'])
-def get_user_details(request, user_id):
+def get_user_details(request, employee_id):
     """Fetch user details by user_id."""
     try:
-        user = User.objects.get(user_id=user_id)
+        user = User.objects.get(employee_id=employee_id)
         # Return only the necessary fields
         user_data = {
             'user_id': user.user_id,
@@ -40,17 +41,17 @@ def get_user_details(request, user_id):
 
 # Conversation views
 @api_view(['GET'])
-def conversation_list_by_user(request, user_id):
-    """Fetch all conversations for a specific user_id without the archived convos.
-        - user_id (required in url)"""
+def conversation_list_by_user(request, employee_id):
+    """Fetch all conversations for a specific employee_id without the archived convos.
+        - employee_id (required in url)"""
     try:
         conversations = Conversation.objects.filter(
-            user_id=user_id, 
+            employee_id=employee_id, 
             is_archived=False
         ).values(
             'conversation_id',
-            'role_id',
-            'user_id',
+            'conversation_title',
+            'employee_id',
             'started_at',
             'updated_at',
             'is_archived'
@@ -66,30 +67,37 @@ def conversation_list_by_user(request, user_id):
 def create_conversation(request):
     """Create a new conversation.
         Needs 
-        - user_id (required)
+        - employee_id (required)
         - role_id (optional)
         - is_archived (optional, defaults to False)
     """
     data = request.data
-    user_id_str = data.get('user_id')
-    if not user_id_str:
-        return JsonResponse({"error": "user_id is required"}, status=400)
+    employee_id_str = data.get('employee_id')
+    
+    if not employee_id_str:
+        return JsonResponse({"error": "employee_id is required"}, status=400)
+
+    user_instance = None
+    try:
+        user_instance = User.objects.get(employee_id=employee_id_str)
+    except User.DoesNotExist:
+        # Decide how to handle: error out or allow conversation without linked user?
+        # Model allows null=True, so we can proceed with user_instance = None
+        print(f"Warning: User with employee_id '{employee_id_str}' not found. Creating conversation without user link.")
+        # If you want to prevent creation without a valid user, uncomment the next line:
+        # return JsonResponse({"error": f"User with employee_id '{employee_id_str}' not found"}, status=404)
+    except Exception as e:
+        print(f"Error fetching user for employee_id {employee_id_str}: {e}")
+        return JsonResponse({"error": f"Failed to verify user: {str(e)}"}, status=500)
+
 
     try:
-        try:
-            user_instance = User.objects.get(user_id=user_id_str)
-            print(f"User found: {user_instance}") # Debugging line to check user retrieval
-        except User.DoesNotExist:
-            # Handle case where the user ID doesn't exist
-            return JsonResponse({"error": f"User with id '{user_id_str}' not found"}, status=404)
-        
-        # Get the current time
         now = timezone.now()
         
         conversation = Conversation.objects.create(
             # Use uuid.uuid4() directly if conversation_id is a UUIDField
-            role_id=data.get('role_id'),
-            user_id=user_instance,
+            conversation_title=None,
+            employee_id=user_instance,
             # Explicitly set started_at and updated_at to the current time
             started_at=now,
             updated_at=now
@@ -99,8 +107,10 @@ def create_conversation(request):
         # Prepare the response data including the timestamps
         response = {
             "conversation_id": conversation.conversation_id,
-            "role_id": conversation.role_id.role_id if conversation.role_id else None,
-            "user_id": conversation.user_id.user_id,
+            "conversation_title": conversation.conversation_title,
+            # --- Extract the employee_id string from the User object ---
+            # --- Handle case where employee_id (User instance) might be None ---
+            "employee_id": conversation.employee_id.employee_id if conversation.employee_id else None,
             "started_at": conversation.started_at.isoformat(), # Format for JSON
             "updated_at": conversation.updated_at.isoformat(), # Format for JSON
             "is_archived": conversation.is_archived,
@@ -120,19 +130,20 @@ def archive_conversation(request, conversation_id):
     try:
         conversation = Conversation.objects.get(conversation_id=conversation_id)
         conversation.is_archived = True
-        conversation.updated_at = timezone.now()
-        conversation.save(update_fields=['is_archived', 'updated_at'])
+        conversation.save(update_fields=['is_archived'])
 
-        response = {
+        response_data = {
             "conversation_id": conversation.conversation_id,
-            "role_id": conversation.role_id.role_id if conversation.role_id else None,
-            "user_id": conversation.user_id.user_id if conversation.user_id else None,
-            "started_at": conversation.started_at,
-            "updated_at": conversation.updated_at,
+            "conversation_title": conversation.conversation_title,
+            # --- Extract employee_id string, handle None ---
+            "employee_id": conversation.employee_id.employee_id if conversation.employee_id else None,
+            # --- Format datetimes to ISO strings ---
+            "started_at": conversation.started_at.isoformat() if conversation.started_at else None,
+            "updated_at": conversation.updated_at.isoformat() if conversation.updated_at else None,
             "is_archived": conversation.is_archived,
         }
         return JsonResponse(
-            {"status": "Conversation archived", "conversation": response}, 
+            {"status": "Conversation archived", "conversation": response_data}, 
             status=200
         )
     except Conversation.DoesNotExist:
@@ -144,8 +155,9 @@ def archive_conversation(request, conversation_id):
             status=500
         )
 
-# Message views
-@csrf_exempt # Keep csrf_exempt if this view might be called from non-browser clients without CSRF tokens
+# --- Message views ---
+# load_messages needs to return role_id
+@api_view(['GET']) # Use @api_view for consistency
 def load_messages(request, conversation_id):
     """Handle GET requests for messages using Django ORM.
         - conversation_id (required in url)"""
@@ -157,7 +169,7 @@ def load_messages(request, conversation_id):
 
     try:
         # Use Django ORM to filter messages by conversation_id
-        messages_queryset = Message.objects.filter(conversation_id=conversation_id).order_by('created_at')
+        messages_queryset = Message.objects.select_related('role_id').filter(conversation_id=conversation_id).order_by('created_at')
 
         # Check if any messages were found
         if not messages_queryset.exists():
@@ -170,6 +182,7 @@ def load_messages(request, conversation_id):
                 "message_id": msg.message_id,
                 "conversation_id": str(msg.conversation_id), # Ensure UUID is serialized correctly if needed
                 "sender": msg.sender,
+                "role_id": msg.role_id.role_id if msg.role_id else None,
                 "message": msg.message,
                 "created_at": msg.created_at.isoformat(), # Format datetime for JSON
                 "intent": msg.intent,
@@ -187,14 +200,15 @@ def load_messages(request, conversation_id):
         # Catch other potential errors during ORM query or serialization
         return JsonResponse({"error": f"Failed to fetch messages: {str(e)}"}, status=500)
 
-@csrf_exempt
+# create_message needs to fetch and add role_id
+@api_view(['POST'])
 def create_message(request, conversation_id):
     """Handle POST requests to create a new message using Django ORM.
         - conversation_id (required in url)
         - sender (required, either 'user' or 'bot') in body of request
         - message (required) in body of request"""
-    if request.method != 'POST':
-        return JsonResponse({"error": "Method not allowed"}, status=405)
+
+    # Removed method check as @api_view handles it for POST
 
     if not conversation_id:
         return JsonResponse({"error": "conversation_id parameter is required"}, status=400)
@@ -204,71 +218,140 @@ def create_message(request, conversation_id):
         if request.content_type == 'application/json':
             data = json.loads(request.body)
         else:
-            # Assume form data if not JSON
-            data = request.POST.copy()
+            # Fallback or specific handling for form data if needed
+            # For simplicity, assuming JSON for now based on frontend likely usage
+            data = request.data # Use request.data with DRF @api_view
+            # data = request.POST.copy() # If strictly using forms
     except json.JSONDecodeError:
+        # request.data handles JSON parsing with DRF, so this might be less needed
         return JsonResponse({"error": "Invalid JSON data"}, status=400)
+    except Exception as e:
+         # Catch potential errors if request.data fails
+         print(f"Error parsing request data: {e}")
+         return JsonResponse({"error": "Could not parse request data"}, status=400)
 
-    # Required fields validation
+
     sender = data.get('sender')
-    message_text = data.get('message') # Renamed to avoid conflict with model name
+    message_text = data.get('message')
 
     if not sender or not message_text:
-        return JsonResponse(
-            {"error": "sender and message are required fields"},
-            status=400
-        )
-
-    # Sender validation (can also be handled by model choices)
+        return JsonResponse({"error": "sender and message are required fields"}, status=400)
     if sender not in ['user', 'bot']:
-        return JsonResponse(
-            {"error": "sender must be either 'user' or 'bot'"},
-            status=400
-        )
+        return JsonResponse({"error": "sender must be either 'user' or 'bot'"}, status=400)
 
     try:
-        # Check if conversation exists using ORM
-        try:
-            conversation = Conversation.objects.get(conversation_id=conversation_id)
-        except Conversation.DoesNotExist:
-            return JsonResponse(
-                {"error": f"Conversation with id {conversation_id} does not exist"},
-                status=404 # Use 404 for resource not found
-            )
+        conversation = Conversation.objects.get(conversation_id=conversation_id)
 
-        # Create message object using ORM
+        # --- Logic to determine if title should be generated/updated ---
+        should_generate_title = False
+        first_user_message_text = None
+
+        # Check only when the BOT is sending a message
+        if sender == 'bot' and not conversation.conversation_title:
+            # Check if this is the FIRST bot message being added
+            if not Message.objects.filter(conversation=conversation, sender='bot').exists():
+                # Try to get the first user message for context
+                first_user_message = Message.objects.filter(
+                    conversation=conversation, sender='user'
+                ).order_by('created_at').first()
+
+                if first_user_message:
+                    should_generate_title = True
+                    first_user_message_text = first_user_message.message
+        # --- End title generation check ---
+
+        # --- Get User Role INSTANCE ---
+        user_role_instance = None # Initialize as None
+        if conversation.employee_id: # Check if conversation has an associated user
+            try:
+                # Fetch user based on employee_id from conversation
+                # Ensure the User model has a 'role' ForeignKey to RolePerm
+                user = User.objects.select_related('role').get(employee_id=conversation.employee_id.employee_id) # Access employee_id string field
+                if hasattr(user, 'role') and user.role: # Check if role relationship exists and is not None
+                    user_role_instance = user.role # <-- Get the RolePerm instance
+                else:
+                     print(f"User {user.employee_id} found but has no associated role.")
+            except User.DoesNotExist:
+                # User linked to conversation doesn't exist in User table (data integrity issue?)
+                print(f"Warning: User with employee_id {conversation.employee_id.employee_id} (from conversation) not found in User table.")
+            except AttributeError:
+                 # This might happen if the User model doesn't have a 'role' field defined correctly
+                 print(f"Warning: User model for {conversation.employee_id.employee_id} might not have a 'role' attribute or it's misconfigured.")
+            except Exception as e:
+                 # Catch other potential errors during user/role lookup
+                 print(f"Error fetching user/role for employee_id {conversation.employee_id.employee_id}: {e}")
+        # --- End Get User Role INSTANCE ---
+
+
+        # Create message object
         new_message = Message.objects.create(
-            # message_id is likely auto-generated by the model (UUIDField(primary_key=True, default=uuid.uuid4))
-            # If not, generate it: message_id=data.get('message_id', uuid.uuid4().hex),
-            conversation=conversation, # Link to the conversation object
+            conversation=conversation,
             sender=sender,
+            # --- Assign the RolePerm instance ---
+            role_id=user_role_instance, # Assign the fetched RolePerm instance (can be None)
             message=message_text,
-            intent=data.get('intent') or None,
-            error=bool(data.get('error', False)),
-            sql_query=data.get('sql_query') or None
-            # created_at is likely auto_now_add=True in the model
+            intent=data.get('intent'), # Get intent if provided
+            error=data.get('error', False), # Get error flag if provided
+            sql_query=data.get('sql_query') # Get sql_query if provided
         )
 
-        # --- Update Conversation Timestamp ---
-        # Set the conversation's updated_at to the current time
-        conversation.updated_at = datetime.now() # Use timezone.now() for timezone awareness
-        conversation.save(update_fields=['updated_at']) # Efficiently save only the updated field
+        # --- Generate Title with LangChain (if needed) & Update Conversation ---
+        update_fields = ['updated_at'] # Always update timestamp because a message was added
+        generated_title = None
+
+        # --- Use the imported chain ---
+        if should_generate_title and title_generation_chain and first_user_message_text:
+            try:
+                print(f"Attempting to generate title for convo {conversation_id}...")
+                # Invoke the chain with context
+                generated_title = title_generation_chain.invoke({
+                    "user_message": first_user_message_text,
+                    "bot_message": message_text # The bot message being saved now
+                })
+                generated_title = generated_title.strip().strip('"') # Clean up output
+
+                if generated_title: # Check if LLM returned something
+                    print(f"Generated title: {generated_title}")
+                    conversation.conversation_title = generated_title[:255] # Truncate if needed for model field length
+                    update_fields.append('conversation_title')
+                else:
+                    print("LLM returned empty title, skipping title update.")
+
+            except Exception as llm_error:
+                # Log the error but don't stop the message creation process
+                print(f"Error generating title with LangChain/Gemini: {llm_error}")
+                # Continue without updating the title
+
+        # Save the conversation - auto_now=True handles updated_at automatically
+        # Only save fields that were actually changed for efficiency
+        conversation.save(update_fields=update_fields)
         # --- End Update ---
 
-
         # Serialize the new message object for the response
-        response_data = model_to_dict(new_message)
-        response_data['conversation_id'] = str(new_message.conversation.conversation_id)
-        if 'created_at' in response_data and hasattr(response_data['created_at'], 'isoformat'):
-            response_data['created_at'] = response_data['created_at'].isoformat()
+        response_data = {
+            "message_id": new_message.message_id,
+            "conversation_id": new_message.conversation.conversation_id, # Access via the instance
+            "sender": new_message.sender,
+            # --- Get role_id string from the instance for the response ---
+            "role_id": new_message.role_id.role_id if new_message.role_id else None,
+            "message": new_message.message,
+            "created_at": new_message.created_at.isoformat(), # Format datetime
+            "intent": new_message.intent,
+            "error": new_message.error,
+            "sql_query": new_message.sql_query,
+            "conversation_title": conversation.conversation_title
+            # Optionally include generated title in response if needed by frontend
+            # "generated_title": generated_title if 'conversation_title' in update_fields else None
+        }
+        return JsonResponse(response_data, status=201) # 201 Created status
 
-        return JsonResponse(response_data, status=201)
-
-    except ValidationError as e:
-         return JsonResponse({"error": e.message_dict}, status=400)
+    except Conversation.DoesNotExist:
+         # If the conversation_id provided in the URL doesn't exist
+         return JsonResponse({"error": f"Conversation with id {conversation_id} does not exist"}, status=404)
     except Exception as e:
-        # Log the error for debugging
-        print(f"Error creating message or updating conversation: {e}") 
+        # Catch-all for other unexpected errors during message creation or conversation update
+        print(f"Error creating message or updating conversation {conversation_id}: {e}")
+        # Consider more specific logging here
         return JsonResponse({"error": f"Failed to create message: {str(e)}"}, status=500)
 
 

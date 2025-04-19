@@ -222,6 +222,38 @@ def analyze_sql_results(results, user_input, chain_wrapper):
                 .removesuffix("```")
                 .removesuffix("'''"))
     
+# --- Function to initialize and return the LLM chain ---
+def initialize_title_generation_chain():
+    """Initializes and returns the LangChain components for title generation."""
+    try:
+        ai_config = settings.AI_CONFIG['default']
+        llm = ChatGoogleGenerativeAI(
+            model=ai_config["model"],
+            google_api_key=ai_config["api_key"],
+            temperature=0.1
+        )
+        title_prompt_template = ChatPromptTemplate.from_messages([
+            ("system", "You are an assistant skilled at creating concise conversation titles."),
+            ("human", """Based on the following initial exchange, generate a short, relevant title (max 10 words) for this conversation. Output only the title itself, nothing else.
+
+User: "{user_message}"
+Bot: "{bot_message}"
+
+Title:"""),
+        ])
+
+        chain = title_prompt_template | llm | StrOutputParser()
+        return chain
+
+    except Exception as e:
+        print(f"CRITICAL Error initializing LangChain/Gemini Title Chain: {e}")
+        # Depending on requirements, you might raise the error or return None
+        return None
+
+# --- Initialize at module level by calling the function ---
+# This ensures it runs once when the module is first imported.
+title_generation_chain = initialize_title_generation_chain()
+
 def get_kinetiq_database_schema():
     """Get complete schema information for Kinetiq database."""
     schema_info = {}

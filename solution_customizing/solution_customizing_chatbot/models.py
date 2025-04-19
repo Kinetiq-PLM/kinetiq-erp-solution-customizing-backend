@@ -24,7 +24,7 @@ class User(models.Model):
         (INACTIVE, 'Inactive'),
     ]
     user_id = models.CharField(primary_key=True, max_length=255)
-    employee_id = models.CharField(max_length=255, null=True, blank=True)
+    employee_id = models.CharField(max_length=255, null=True, blank=True, unique=True)
     first_name = models.CharField(max_length=255)
     last_name = models.CharField(max_length=255)
     role = models.ForeignKey(RolePerm, on_delete=models.SET_NULL, null=True, blank=True, to_field='role_id', db_column='role_id')
@@ -49,18 +49,17 @@ class Conversation(models.Model):
         default=generate_convo_id,
         editable=False
     )
-    
-    role_id = models.ForeignKey(RolePerm, on_delete=models.SET_NULL, null=True, blank=True, to_field='role_id', db_column='role_id')
-    user_id = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, to_field='user_id', db_column='user_id')
+    conversation_title = models.CharField(max_length=255, null=True, blank=True)
+    employee_id = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, to_field='employee_id', db_column='employee_id')
     started_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(null=True, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
     is_archived = models.BooleanField(default=False)
 
     def delete(self, *args, **kwargs):
         """Override delete to set is_archived to True instead of deleting"""
         self.is_archived = True
         self.updated_at = timezone.now()
-        self.save()
+        self.save(update_fields=['is_archived', 'updated_at'])
         return self
 
     def hard_delete(self, *args, **kwargs):
@@ -94,6 +93,14 @@ class Message(models.Model):
         db_column='conversation_id'
     )
     sender = models.CharField(max_length=4, choices=SENDER_CHOICES)
+    role_id = models.ForeignKey(
+        RolePerm,
+        on_delete=models.SET_NULL, # Keep data even if role is deleted, set role to NULL
+        to_field='role_id',        # Link using the role_id field in RolePerm
+        db_column='role_id',       # Map to the existing 'role_id' column in the DB
+        null=True,                 # Allow NULL values in the database column
+        blank=True                 # Allow the field to be blank in forms (like admin)
+    )
     message = models.TextField()
     created_at = models.DateTimeField(auto_now_add=True)
     intent = models.TextField(null=True, blank=True)
