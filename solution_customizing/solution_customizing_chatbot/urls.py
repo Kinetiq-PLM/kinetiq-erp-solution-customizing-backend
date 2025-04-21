@@ -7,7 +7,6 @@ from .views import (
     create_message,
     chatbot,
     get_user_details,
-    get_database_info,
 )
 
 urlpatterns = [
@@ -18,5 +17,5 @@ urlpatterns = [
     path('create_conversation/', create_conversation, name='create_conversation'),   # Requires user_id
     path('create_message/<str:conversation_id>/', create_message, name='create_message'),
     # path('database-schema/', get_database_info, name='database-schema'),
-    path('chatbot/', chatbot, name='chatbot'),
+    path('respond/', chatbot, name='chatbot_respond'),
 ]

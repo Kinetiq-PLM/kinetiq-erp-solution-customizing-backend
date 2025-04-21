@@ -3,16 +3,18 @@ from django.utils import timezone
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from pydantic import ValidationError
-from rest_framework.decorators import api_view
+from rest_framework.decorators import api_view # Ensure this is imported
+from rest_framework.response import Response # Use DRF Response
+from rest_framework import status # Use DRF status codes
 import json
 from datetime import datetime
 
 from .models import Conversation, Message, User
 from .utils import (
-    connect_to_postgres, execute_query,
-    setup_langchain_agent, process_user_input, analyze_sql_results,
+    execute_query,
+    process_user_input, analyze_sql_results,
     title_generation_chain,
-    get_kinetiq_database_schema
+    AGENT_CHAIN
 )
 
 
@@ -340,8 +342,6 @@ def create_message(request, conversation_id):
             "error": new_message.error,
             "sql_query": new_message.sql_query,
             "conversation_title": conversation.conversation_title
-            # Optionally include generated title in response if needed by frontend
-            # "generated_title": generated_title if 'conversation_title' in update_fields else None
         }
         return JsonResponse(response_data, status=201) # 201 Created status
 
@@ -355,65 +355,103 @@ def create_message(request, conversation_id):
         return JsonResponse({"error": f"Failed to create message: {str(e)}"}, status=500)
 
 
-@csrf_exempt
+@api_view(['POST'])
 def chatbot(request):
-    """Django view to handle chatbot requests
-        - GET request with 'message' query parameter"""
-    if request.method == 'GET':
-        user_input = request.GET.get('message', '')
-        if not user_input:
-             return JsonResponse({"error": "message query parameter is required"}, status=400)
-    else:
-        return JsonResponse({"error": "Only GET requests are supported"}, status=405) # Use 405 Method Not Allowed
+    """Django view to handle chatbot requests via POST for a specific conversation"""
+    print("\n--- [DEBUG] Chatbot view received request ---") # DEBUG START
 
+    # --- Extract data from request body ---
+    user_input = request.data.get('message', '')
+    conversation_id = request.data.get('conversation_id', None)
+    print(f"[DEBUG] Extracted conversation_id: {conversation_id}") # DEBUG
+    print(f"[DEBUG] Extracted user_input: '{user_input}'") # DEBUG
+
+    # --- Validate input ---
+    if not user_input:
+        print("[DEBUG] Validation failed: 'message' field missing.") # DEBUG
+        return Response({"error": "JSON body must contain a 'message' field"}, status=status.HTTP_400_BAD_REQUEST)
+    if not conversation_id:
+        print("[DEBUG] Validation failed: 'conversation_id' field missing.") # DEBUG
+        return Response({"error": "JSON body must contain a 'conversation_id' field"}, status=status.HTTP_400_BAD_REQUEST)
+
+    # --- Check if conversation exists ---
     try:
-        # Get the comprehensive schema using the utility function
-        # db_schema = get_kinetiq_database_schema()
-        db_schema = {}
-        # Set up LangChain agent (could be cached for performance)
-        chain = setup_langchain_agent() # Assuming this function doesn't need a connection object
-        json_response = process_user_input(user_input, chain, db_schema)
-        final_response = {"response": json_response.get("answer", "No answer generated.")} # Use .get for safety
+        print(f"[DEBUG] Checking existence for conversation_id: {conversation_id}") # DEBUG
+        conversation = Conversation.objects.get(conversation_id=conversation_id)
+        print(f"[DEBUG] Conversation found: {conversation.conversation_id}") # DEBUG
+    except Conversation.DoesNotExist:
+        print(f"[DEBUG] Conversation not found for ID: {conversation_id}") # DEBUG
+        return Response({"error": "Conversation not found"}, status=status.HTTP_404_NOT_FOUND)
+    except ValueError: # Handle cases where the provided ID is not a valid UUID format
+         print(f"[DEBUG] Invalid conversation_id format: {conversation_id}") # DEBUG
+         return Response({"error": "Invalid conversation_id format"}, status=status.HTTP_400_BAD_REQUEST)
+    except Exception as e:
+        print(f"[DEBUG] Error checking conversation existence: {e}") # DEBUG
+        return Response({"error": f"Error verifying conversation: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-        # Execute SQL query if present
-        sql_query = json_response.get("sql_query")
+
+    # --- Process the request using the conversation_id from the body ---
+    try:
+        print(f"[DEBUG] Calling process_user_input for convo {conversation_id}...") # DEBUG
+        llm_response_json = process_user_input(user_input, conversation_id, AGENT_CHAIN) # Renamed for clarity
+        print(f"[DEBUG] Received json_response from LLM: {llm_response_json}") # DEBUG
+
+        # --- Store the initial response and potential query ---
+        final_response = {"response": llm_response_json.get("answer", "No answer generated.")}
+        sql_query = llm_response_json.get("sql_query")
+        # --- Add the sql_query to the final response *before* potential modification by analysis ---
+        final_response["sql_query"] = sql_query # Add query here
+
+        print(f"[DEBUG] Extracted SQL query from response: '{sql_query}'") # DEBUG
+
         if sql_query and sql_query.strip() and sql_query.lower() != "none":
-            connection = connect_to_postgres() # Connect only if executing SQL
-            if not connection:
-                 # Log this error internally
-                 print("Error: Database connection failed during SQL execution.")
-                 # Optionally add error info to response, but might expose details
-                 # final_response["error"] = "Database connection failed during SQL execution."
-            else:
-                try:
-                    result = execute_query(connection, sql_query)
-                    # Add data only if query execution was successful and returned results
-                    if result is not None: # Check if execute_query returned something meaningful
-                         final_response["data"] = result
-                         # Optionally analyze result if intent matches
-                         if json_response.get("intent") == "generate_sql":
-                              analysis = analyze_sql_results(result, user_input, chain)
-                              final_response["response"] = analysis # Overwrite initial response with analysis
+            print(f"[DEBUG] SQL query found. Attempting execution...") # DEBUG
+            try:
+                print(f"[DEBUG] Calling execute_query with: {sql_query}") # DEBUG
+                result = execute_query(sql_query)
+                print(f"[DEBUG] Received result from execute_query: {result}") # DEBUG
 
-                except Exception as e:
-                    print(f"Error executing SQL query: {e}") # Log the specific SQL error
-                    final_response["sql_error"] = f"Error executing generated SQL: {str(e)}" # Add specific SQL error info
-                finally:
-                     if connection:
-                          connection.close() # Ensure connection is closed
+                if result and "error" in result:
+                     print(f"[DEBUG] SQL execution error: {result['error']}") # DEBUG
+                     final_response["sql_error"] = f"Error executing generated SQL: {result['error']}"
+                     # Keep the original LLM answer in case of SQL error
+                elif result and result.get("headers") is not None and result.get("rows") is not None:
+                     print("[DEBUG] SQL execution successful. Adding data to response.") # DEBUG
+                     final_response["data"] = result
+                     if llm_response_json.get("intent") == "generate_sql":
+                          print("[DEBUG] Intent is 'generate_sql'. Calling analyze_sql_results...") # DEBUG
+                          analysis = analyze_sql_results(result, user_input, conversation_id, AGENT_CHAIN)
+                          print(f"[DEBUG] Received analysis from LLM: {analysis}") # DEBUG
+                          # --- Overwrite the 'response' field with the analysis ---
+                          final_response["response"] = analysis
+                     else:
+                          print("[DEBUG] Intent is not 'generate_sql', skipping analysis.") # DEBUG
+                else:
+                     print("[DEBUG] SQL execution result format unexpected or empty.") # DEBUG
+                     # Keep the original LLM answer if SQL result is weird
+            except Exception as e:
+                print(f"[DEBUG] Unexpected error during SQL execution/analysis phase: {e}") # DEBUG
+                final_response["sql_error"] = f"Unexpected error during SQL execution: {str(e)}"
+                # Keep the original LLM answer
+        else:
+            print("[DEBUG] No valid SQL query found in LLM response.") # DEBUG
+            # Ensure sql_query in final_response remains None or the invalid value it had
 
-        return JsonResponse(final_response, status=200)
+        print(f"[DEBUG] Preparing final response: {final_response}") # DEBUG
+        # --- The final_response now includes 'response', 'sql_query' (if any), 'data' (if any), 'sql_error' (if any) ---
+        return Response(final_response, status=status.HTTP_200_OK)
 
     except Exception as e:
-         # Catch errors from get_kinetiq_database_schema, setup_langchain_agent, process_user_input
-         print(f"Error in chatbot view: {e}") # Log the general error
-         return JsonResponse({"error": f"An unexpected error occurred: {str(e)}"}, status=500)
+         # ... (existing error handling) ...
+         print(f"[DEBUG] ERROR in main chatbot processing block for conversation {conversation_id}: {e}") # DEBUG
+         import traceback
+         traceback.print_exc()
+         return Response({"error": f"An unexpected error occurred: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 @api_view(['GET'])
 def get_database_info(request):
     """Endpoint to get complete database schema information."""
     try:
-        # schema_info = get_kinetiq_database_schema()
         schema_info = {}
         return JsonResponse({
             'status': 'success',
