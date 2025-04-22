@@ -13,6 +13,8 @@
         "project_name": "solution-custom",
         "runtime": "python3.12",
         "s3_bucket": "zappa-solution-customizing",
+        "timeout_seconds": 60,
+        "xray_tracing": true,
         "vpc_config": {
             "SubnetIds": [
             "subnet-0afd6c1a25f45edca",
