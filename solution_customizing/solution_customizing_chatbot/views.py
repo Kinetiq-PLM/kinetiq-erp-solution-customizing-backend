@@ -2,12 +2,10 @@ from django.forms import model_to_dict
 from django.utils import timezone
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
-from pydantic import ValidationError
-from rest_framework.decorators import api_view # Ensure this is imported
-from rest_framework.response import Response # Use DRF Response
-from rest_framework import status # Use DRF status codes
+from rest_framework.decorators import api_view
+from rest_framework.response import Response
+from rest_framework import status
 import json
-from datetime import datetime
 
 from .models import Conversation, Message, User
 from .utils import (
@@ -20,32 +18,40 @@ from .utils import (
 
 @api_view(['GET'])
 def get_user_details(request, employee_id):
-    """Fetch user details by user_id."""
+    """
+    /chatbot/load_user_details/<str:employee_id>/
+    Fetch user details by user_id.
+        - employee_id (required in url)
+        - Returns user_id, employee_id, first_name, last_name
+        - NEW: returns role_name, role_description
+    """
     try:
-        user = User.objects.get(employee_id=employee_id)
-        # Return only the necessary fields
+        user = User.objects.select_related('role').get(employee_id=employee_id)
         user_data = {
             'user_id': user.user_id,
             'employee_id': user.employee_id,
             'first_name': user.first_name,
             'last_name': user.last_name,
-            # Add other fields if needed, e.g., role
-            # 'role_id': user.role.role_id if user.role else None
+            'role_name': user.role.role_name if user.role else None,
+            'role_description': user.role.role_description if user.role else None,
         }
         return JsonResponse(user_data, status=200)
     except User.DoesNotExist:
         return JsonResponse({"error": "User not found"}, status=404)
     except Exception as e:
-        # Log the error e
         print(f"Error fetching user details: {e}")
         return JsonResponse({"error": f"Failed to fetch user details: {str(e)}"}, status=500)
 
 
-# Conversation views
 @api_view(['GET'])
 def conversation_list_by_user(request, employee_id):
-    """Fetch all conversations for a specific employee_id without the archived convos.
-        - employee_id (required in url)"""
+    """
+    /chatbot/load_conversations/<str:employee_id>/
+    Fetch all conversations for a specific employee_id without the archived convos.
+        - employee_id (required in url)
+        - Returns conversation_id, conversation_title, updated_at, is_archived
+        - NEW: removed returning employee_id, started_at from the response
+    """
     try:
         conversations = Conversation.objects.filter(
             employee_id=employee_id, 
@@ -53,8 +59,6 @@ def conversation_list_by_user(request, employee_id):
         ).values(
             'conversation_id',
             'conversation_title',
-            'employee_id',
-            'started_at',
             'updated_at',
             'is_archived'
         )
@@ -67,15 +71,14 @@ def conversation_list_by_user(request, employee_id):
 
 @api_view(['POST'])
 def create_conversation(request):
-    """Create a new conversation.
-        Needs 
-        - employee_id (required)
-        - role_id (optional)
-        - is_archived (optional, defaults to False)
+    """
+    /chatbot/create_conversation/
+    Create a new conversation.
+        - employee_id (required in request body)
     """
     data = request.data
     employee_id_str = data.get('employee_id')
-    
+
     if not employee_id_str:
         return JsonResponse({"error": "employee_id is required"}, status=400)
 
@@ -83,11 +86,7 @@ def create_conversation(request):
     try:
         user_instance = User.objects.get(employee_id=employee_id_str)
     except User.DoesNotExist:
-        # Decide how to handle: error out or allow conversation without linked user?
-        # Model allows null=True, so we can proceed with user_instance = None
-        print(f"Warning: User with employee_id '{employee_id_str}' not found. Creating conversation without user link.")
-        # If you want to prevent creation without a valid user, uncomment the next line:
-        # return JsonResponse({"error": f"User with employee_id '{employee_id_str}' not found"}, status=404)
+        return JsonResponse({"error": f"User with employee_id '{employee_id_str}' not found"}, status=404)
     except Exception as e:
         print(f"Error fetching user for employee_id {employee_id_str}: {e}")
         return JsonResponse({"error": f"Failed to verify user: {str(e)}"}, status=500)
@@ -95,74 +94,68 @@ def create_conversation(request):
 
     try:
         now = timezone.now()
-        
+
         conversation = Conversation.objects.create(
-            # Use uuid.uuid4() directly if conversation_id is a UUIDField
             conversation_title=None,
             employee_id=user_instance,
-            # Explicitly set started_at and updated_at to the current time
             started_at=now,
             updated_at=now
-            # is_archived defaults to False based on the model definition (usually)
         )
-        
-        # Prepare the response data including the timestamps
-        response = {
+
+        response_data = {
             "conversation_id": conversation.conversation_id,
             "conversation_title": conversation.conversation_title,
-            # --- Extract the employee_id string from the User object ---
-            # --- Handle case where employee_id (User instance) might be None ---
             "employee_id": conversation.employee_id.employee_id if conversation.employee_id else None,
-            "started_at": conversation.started_at.isoformat(), # Format for JSON
-            "updated_at": conversation.updated_at.isoformat(), # Format for JSON
+            "started_at": conversation.started_at.isoformat(),
+            "updated_at": conversation.updated_at.isoformat(),
             "is_archived": conversation.is_archived,
         }
-        return JsonResponse(response, status=201)
+        return JsonResponse(response_data, status=201)
     except Exception as e:
-        # Consider logging the error e
+        print(f"Error creating conversation: {e}")
         return JsonResponse(
-            {"error": f"Failed to create conversation: {str(e)}"}, 
+            {"error": f"Failed to create conversation: {str(e)}"},
             status=500
         )
 
 @api_view(['PATCH'])
 def archive_conversation(request, conversation_id):
-    """Archive a specific conversation.
-        -conversation_id (required in url)"""
+    """
+    /chatbot/archive_conversation/<str:conversation_id>/
+    Archive a specific conversation.
+        -conversation_id (required in url)
+    """
     try:
         conversation = Conversation.objects.get(conversation_id=conversation_id)
+        
+        # Check if already archived to avoid unnecessary save
+        if conversation.is_archived:
+            return JsonResponse(
+                {"status": "Conversation already archived", "conversation_id": conversation_id}, status=200
+            )
         conversation.is_archived = True
         conversation.save(update_fields=['is_archived'])
 
-        response_data = {
-            "conversation_id": conversation.conversation_id,
-            "conversation_title": conversation.conversation_title,
-            # --- Extract employee_id string, handle None ---
-            "employee_id": conversation.employee_id.employee_id if conversation.employee_id else None,
-            # --- Format datetimes to ISO strings ---
-            "started_at": conversation.started_at.isoformat() if conversation.started_at else None,
-            "updated_at": conversation.updated_at.isoformat() if conversation.updated_at else None,
-            "is_archived": conversation.is_archived,
-        }
         return JsonResponse(
-            {"status": "Conversation archived", "conversation": response_data}, 
+            {"status": "Conversation archived", "conversation_id": conversation_id}, 
             status=200
         )
     except Conversation.DoesNotExist:
         return JsonResponse({"error": "Conversation not found"}, status=404)
     except Exception as e:
-        print(f"Error archiving conversation: {e}")
+        print(f"Error archiving conversation {conversation_id}: {e}")
         return JsonResponse(
             {"error": f"Failed to archive conversation: {str(e)}"}, 
             status=500
         )
 
-# --- Message views ---
-# load_messages needs to return role_id
-@api_view(['GET']) # Use @api_view for consistency
+@api_view(['GET'])
 def load_messages(request, conversation_id):
-    """Handle GET requests for messages using Django ORM.
-        - conversation_id (required in url)"""
+    """
+    /chatbot/load_messages/<str:conversation_id>/
+    Handle GET requests for messages.
+        - conversation_id (required in url)
+    """
     if request.method != 'GET':
         return JsonResponse({"error": "Method not allowed"}, status=405)
 
@@ -170,10 +163,8 @@ def load_messages(request, conversation_id):
         return JsonResponse({"error": "conversation_id parameter is required"}, status=400)
 
     try:
-        # Use Django ORM to filter messages by conversation_id
         messages_queryset = Message.objects.select_related('role_id').filter(conversation_id=conversation_id).order_by('created_at')
 
-        # Check if any messages were found
         if not messages_queryset.exists():
             # Return an empty list if no messages are found for the conversation
             return JsonResponse([], safe=False, status=200)
@@ -182,11 +173,11 @@ def load_messages(request, conversation_id):
         messages_list = [
             {
                 "message_id": msg.message_id,
-                "conversation_id": str(msg.conversation_id), # Ensure UUID is serialized correctly if needed
+                "conversation_id": str(msg.conversation_id),
                 "sender": msg.sender,
                 "role_id": msg.role_id.role_id if msg.role_id else None,
                 "message": msg.message,
-                "created_at": msg.created_at.isoformat(), # Format datetime for JSON
+                "created_at": msg.created_at.isoformat(),
                 "intent": msg.intent,
                 "error": msg.error,
                 "sql_query": msg.sql_query,
@@ -195,42 +186,33 @@ def load_messages(request, conversation_id):
         ]
         return JsonResponse(messages_list, safe=False, status=200)
     except Message.DoesNotExist:
-        # This case might not be strictly necessary with filter().exists() check,
-        # but good practice for specific object lookups.
         return JsonResponse({"error": "Messages not found for this conversation"}, status=404)
     except Exception as e:
-        # Catch other potential errors during ORM query or serialization
         return JsonResponse({"error": f"Failed to fetch messages: {str(e)}"}, status=500)
 
-# create_message needs to fetch and add role_id
 @api_view(['POST'])
 def create_message(request, conversation_id):
-    """Handle POST requests to create a new message using Django ORM.
+    """
+    /chatbot/create_message/<str:conversation_id>/
+    Handle POST requests to create a new message using Django ORM.
         - conversation_id (required in url)
         - sender (required, either 'user' or 'bot') in body of request
-        - message (required) in body of request"""
-
-    # Removed method check as @api_view handles it for POST
+        - message (required) in body of request
+    """
 
     if not conversation_id:
         return JsonResponse({"error": "conversation_id parameter is required"}, status=400)
 
-    # Determine how data is sent (form data or JSON)
     try:
         if request.content_type == 'application/json':
             data = json.loads(request.body)
         else:
-            # Fallback or specific handling for form data if needed
-            # For simplicity, assuming JSON for now based on frontend likely usage
-            data = request.data # Use request.data with DRF @api_view
-            # data = request.POST.copy() # If strictly using forms
+            data = request.data
     except json.JSONDecodeError:
-        # request.data handles JSON parsing with DRF, so this might be less needed
         return JsonResponse({"error": "Invalid JSON data"}, status=400)
     except Exception as e:
-         # Catch potential errors if request.data fails
-         print(f"Error parsing request data: {e}")
-         return JsonResponse({"error": "Could not parse request data"}, status=400)
+        print(f"Error parsing request data: {e}")
+        return JsonResponse({"error": "Could not parse request data"}, status=400)
 
 
     sender = data.get('sender')
@@ -354,15 +336,67 @@ def create_message(request, conversation_id):
         # Consider more specific logging here
         return JsonResponse({"error": f"Failed to create message: {str(e)}"}, status=500)
 
+@api_view(['PATCH'])
+def update_conversation_title(request, conversation_id):
+    """
+    /chatbot/update_title/<str:conversation_id>/
+    Update the title of a specific conversation.
+        - conversation_id (required in url)
+        - title (required in request body/ this is the new updated title)
+    """
+    if not conversation_id:
+        return Response({"error": "conversation_id parameter is required in URL"}, status=status.HTTP_400_BAD_REQUEST)
+
+    data = request.data
+    new_title = data.get('title')
+
+    if not new_title:
+        return Response({"error": "JSON body must contain a 'title' field"}, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        conversation = Conversation.objects.get(conversation_id=conversation_id)
+
+        conversation.conversation_title = new_title[:255] # Truncate if needed
+        conversation.updated_at = timezone.now() # Manually update timestamp
+
+        conversation.save(update_fields=['conversation_title', 'updated_at'])
+
+        # Prepare response data (optional, could just return success status)
+        response_data = {
+            "conversation_id": conversation.conversation_id,
+            "conversation_title": conversation.conversation_title,
+            "updated_at": conversation.updated_at.isoformat(),
+        }
+        return Response(response_data, status=status.HTTP_200_OK)
+
+    except Conversation.DoesNotExist:
+        return Response({"error": "Conversation not found"}, status=status.HTTP_404_NOT_FOUND)
+    except Exception as e:
+        print(f"Error updating title for conversation {conversation_id}: {e}")
+        return Response(
+            {"error": f"Failed to update conversation title: {str(e)}"},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
 
 @api_view(['POST'])
 def chatbot(request):
-    """Django view to handle chatbot requests via POST for a specific conversation"""
+    """
+    /chatbot/respond/
+    Handle chatbot requests for a specific conversation
+        - conversation_id (required in request body)
+        - message (required in request body)
+    """
     print("\n--- [DEBUG] Chatbot view received request ---") # DEBUG START
+    print(f"[DEBUG] Request Method: {request.method}") # DEBUG
+    print(f"[DEBUG] Request Headers: {request.headers}") # DEBUG - Check Content-Type here!
+    print(f"[DEBUG] Request Content-Type: {request.content_type}") # DEBUG - More specific
+    print(f"[DEBUG] Raw Request Body: {request.body}") # DEBUG - See the raw bytes
 
     # --- Extract data from request body ---
-    user_input = request.data.get('message', '')
-    conversation_id = request.data.get('conversation_id', None)
+    data = request.data
+    user_input = data.get('message')
+    conversation_id = data.get('conversation_id')
+    print(f"[DEBUG] Parsed Request Data: {request.data}") # DEBUG - See what DRF parsed
     print(f"[DEBUG] Extracted conversation_id: {conversation_id}") # DEBUG
     print(f"[DEBUG] Extracted user_input: '{user_input}'") # DEBUG
 
@@ -442,23 +476,7 @@ def chatbot(request):
         return Response(final_response, status=status.HTTP_200_OK)
 
     except Exception as e:
-         # ... (existing error handling) ...
-         print(f"[DEBUG] ERROR in main chatbot processing block for conversation {conversation_id}: {e}") # DEBUG
-         import traceback
-         traceback.print_exc()
-         return Response({"error": f"An unexpected error occurred: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-
-@api_view(['GET'])
-def get_database_info(request):
-    """Endpoint to get complete database schema information."""
-    try:
-        schema_info = {}
-        return JsonResponse({
-            'status': 'success',
-            'schema': schema_info
-        })
-    except Exception as e:
-        return JsonResponse({
-            'status': 'error',
-            'message': str(e)
-        }, status=500)
+        print(f"[DEBUG] ERROR in main chatbot processing block for conversation {conversation_id}: {e}") # DEBUG
+        import traceback
+        traceback.print_exc()
+        return Response({"error": f"An unexpected error occurred: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
