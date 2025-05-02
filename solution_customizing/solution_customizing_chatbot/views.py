@@ -75,6 +75,7 @@ def create_conversation(request):
     /chatbot/create_conversation/
     Create a new conversation.
         - employee_id (required in request body)
+        - Returns conversation_id, conversation_title, employee_id, started_at, updated_at, is_archived
     """
     data = request.data
     employee_id_str = data.get('employee_id')
@@ -90,7 +91,6 @@ def create_conversation(request):
     except Exception as e:
         print(f"Error fetching user for employee_id {employee_id_str}: {e}")
         return JsonResponse({"error": f"Failed to verify user: {str(e)}"}, status=500)
-
 
     try:
         now = timezone.now()
@@ -123,7 +123,8 @@ def archive_conversation(request, conversation_id):
     """
     /chatbot/archive_conversation/<str:conversation_id>/
     Archive a specific conversation.
-        -conversation_id (required in url)
+        - conversation_id (required in url)
+        - Returns only a success/error status message
     """
     try:
         conversation = Conversation.objects.get(conversation_id=conversation_id)
@@ -155,6 +156,8 @@ def load_messages(request, conversation_id):
     /chatbot/load_messages/<str:conversation_id>/
     Handle GET requests for messages.
         - conversation_id (required in url)
+        - Returns a list of messages for the conversation
+        - Each message includes message_id, conversation_id, sender, role_id, message, created_at, intent, error, sql_query
     """
     if request.method != 'GET':
         return JsonResponse({"error": "Method not allowed"}, status=405)
@@ -254,7 +257,7 @@ def create_message(request, conversation_id):
                 if hasattr(user, 'role') and user.role: # Check if role relationship exists and is not None
                     user_role_instance = user.role # <-- Get the RolePerm instance
                 else:
-                     print(f"User {user.employee_id} found but has no associated role.")
+                    print(f"User {user.employee_id} found but has no associated role.")
             except User.DoesNotExist:
                 # User linked to conversation doesn't exist in User table (data integrity issue?)
                 print(f"Warning: User with employee_id {conversation.employee_id.employee_id} (from conversation) not found in User table.")
@@ -343,39 +346,37 @@ def update_conversation_title(request, conversation_id):
     Update the title of a specific conversation.
         - conversation_id (required in url)
         - title (required in request body/ this is the new updated title)
+        - Returns only a success/error status message
     """
     if not conversation_id:
-        return Response({"error": "conversation_id parameter is required in URL"}, status=status.HTTP_400_BAD_REQUEST)
+        return JsonResponse({"error": "conversation_id parameter is required in URL"}, status=400)
 
     data = request.data
     new_title = data.get('title')
 
     if not new_title:
-        return Response({"error": "JSON body must contain a 'title' field"}, status=status.HTTP_400_BAD_REQUEST)
+        return JsonResponse({"error": "JSON body must contain a 'title' field"}, status=400)
 
     try:
         conversation = Conversation.objects.get(conversation_id=conversation_id)
 
         conversation.conversation_title = new_title[:255] # Truncate if needed
-        conversation.updated_at = timezone.now() # Manually update timestamp
+        conversation.updated_at = timezone.now()
 
         conversation.save(update_fields=['conversation_title', 'updated_at'])
 
-        # Prepare response data (optional, could just return success status)
-        response_data = {
-            "conversation_id": conversation.conversation_id,
-            "conversation_title": conversation.conversation_title,
-            "updated_at": conversation.updated_at.isoformat(),
-        }
-        return Response(response_data, status=status.HTTP_200_OK)
+        return JsonResponse(
+            {"status": "Conversation title updated", "conversation_id": conversation_id},
+            status=200
+        )
 
     except Conversation.DoesNotExist:
-        return Response({"error": "Conversation not found"}, status=status.HTTP_404_NOT_FOUND)
+        return JsonResponse({"error": "Conversation not found"}, status=404)
     except Exception as e:
         print(f"Error updating title for conversation {conversation_id}: {e}")
-        return Response(
+        return JsonResponse(
             {"error": f"Failed to update conversation title: {str(e)}"},
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            status=500
         )
 
 @api_view(['POST'])
@@ -417,8 +418,8 @@ def chatbot(request):
         print(f"[DEBUG] Conversation not found for ID: {conversation_id}") # DEBUG
         return Response({"error": "Conversation not found"}, status=status.HTTP_404_NOT_FOUND)
     except ValueError: # Handle cases where the provided ID is not a valid UUID format
-         print(f"[DEBUG] Invalid conversation_id format: {conversation_id}") # DEBUG
-         return Response({"error": "Invalid conversation_id format"}, status=status.HTTP_400_BAD_REQUEST)
+        print(f"[DEBUG] Invalid conversation_id format: {conversation_id}") # DEBUG
+        return Response({"error": "Invalid conversation_id format"}, status=status.HTTP_400_BAD_REQUEST)
     except Exception as e:
         print(f"[DEBUG] Error checking conversation existence: {e}") # DEBUG
         return Response({"error": f"Error verifying conversation: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -446,23 +447,23 @@ def chatbot(request):
                 print(f"[DEBUG] Received result from execute_query: {result}") # DEBUG
 
                 if result and "error" in result:
-                     print(f"[DEBUG] SQL execution error: {result['error']}") # DEBUG
-                     final_response["sql_error"] = f"Error executing generated SQL: {result['error']}"
-                     # Keep the original LLM answer in case of SQL error
+                    print(f"[DEBUG] SQL execution error: {result['error']}") # DEBUG
+                    final_response["sql_error"] = f"Error executing generated SQL: {result['error']}"
+                    # Keep the original LLM answer in case of SQL error
                 elif result and result.get("headers") is not None and result.get("rows") is not None:
-                     print("[DEBUG] SQL execution successful. Adding data to response.") # DEBUG
-                     final_response["data"] = result
-                     if llm_response_json.get("intent") == "generate_sql":
-                          print("[DEBUG] Intent is 'generate_sql'. Calling analyze_sql_results...") # DEBUG
-                          analysis = analyze_sql_results(result, user_input, conversation_id, AGENT_CHAIN)
-                          print(f"[DEBUG] Received analysis from LLM: {analysis}") # DEBUG
-                          # --- Overwrite the 'response' field with the analysis ---
-                          final_response["response"] = analysis
-                     else:
-                          print("[DEBUG] Intent is not 'generate_sql', skipping analysis.") # DEBUG
+                    print("[DEBUG] SQL execution successful. Adding data to response.") # DEBUG
+                    final_response["data"] = result
+                    if llm_response_json.get("intent") == "generate_sql":
+                        print("[DEBUG] Intent is 'generate_sql'. Calling analyze_sql_results...") # DEBUG
+                        analysis = analyze_sql_results(result, user_input, conversation_id, AGENT_CHAIN)
+                        print(f"[DEBUG] Received analysis from LLM: {analysis}") # DEBUG
+                        # --- Overwrite the 'response' field with the analysis ---
+                        final_response["response"] = analysis
+                    else:
+                        print("[DEBUG] Intent is not 'generate_sql', skipping analysis.") # DEBUG
                 else:
-                     print("[DEBUG] SQL execution result format unexpected or empty.") # DEBUG
-                     # Keep the original LLM answer if SQL result is weird
+                    print("[DEBUG] SQL execution result format unexpected or empty.") # DEBUG
+                    # Keep the original LLM answer if SQL result is weird
             except Exception as e:
                 print(f"[DEBUG] Unexpected error during SQL execution/analysis phase: {e}") # DEBUG
                 final_response["sql_error"] = f"Unexpected error during SQL execution: {str(e)}"
