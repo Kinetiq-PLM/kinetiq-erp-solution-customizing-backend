@@ -1,6 +1,7 @@
 import traceback
 from django.utils import timezone
 from django.http import JsonResponse
+from django.views.decorators.csrf import csrf_exempt
 from rest_framework.decorators import api_view
 from rest_framework import status
 import json
@@ -464,6 +465,7 @@ def update_conversation_title(request, conversation_id):
             status=500
         )
 
+@csrf_exempt
 @api_view(['POST'])
 def chatbot(request):
     """
