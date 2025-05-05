@@ -1,18 +1,18 @@
-from django.forms import model_to_dict
+import traceback
 from django.utils import timezone
 from django.http import JsonResponse
-from django.views.decorators.csrf import csrf_exempt
 from rest_framework.decorators import api_view
-from rest_framework.response import Response
 from rest_framework import status
 import json
+
 
 from .models import Conversation, Message, User
 from .utils import (
     execute_query,
     process_user_input, analyze_sql_results,
     title_generation_chain,
-    AGENT_CHAIN
+    AGENT_CHAIN,
+    LLM_INSTANCE
 )
 
 
@@ -33,7 +33,7 @@ def get_user_details(request, employee_id):
             'first_name': user.first_name,
             'last_name': user.last_name,
             'role_name': user.role.role_name if user.role else None,
-            'role_description': user.role.role_description if user.role else None,
+            'role_description': user.role.description if user.role else None,
         }
         return JsonResponse(user_data, status=200)
     except User.DoesNotExist:
@@ -149,6 +149,76 @@ def archive_conversation(request, conversation_id):
             {"error": f"Failed to archive conversation: {str(e)}"}, 
             status=500
         )
+    
+@api_view(['POST'])
+def generate_conversation_title(request, conversation_id):
+    """
+    /chatbot/generate_title/<str:conversation_id>/
+    Explicitly generates or regenerates a title for a given conversation
+    based on the first user and bot messages.
+    """
+    if not conversation_id:
+        return JsonResponse({"error": "conversation_id parameter is required in URL"}, status=status.HTTP_400_BAD_REQUEST)
+
+    if not title_generation_chain:
+        return JsonResponse({"error": "Title generation feature not initialized."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    try:
+        conversation = Conversation.objects.get(conversation_id=conversation_id)
+
+        # Fetch the first user message
+        first_user_message = Message.objects.filter(
+            conversation=conversation, sender='user'
+        ).order_by('created_at').first()
+
+        # Fetch the first bot message
+        first_bot_message = Message.objects.filter(
+            conversation=conversation, sender='bot'
+        ).order_by('created_at').first()
+
+        if not first_user_message or not first_bot_message:
+            return JsonResponse(
+                {"error": "Cannot generate title: Initial user or bot message missing."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Invoke the title generation chain
+        try:
+            title_result = title_generation_chain.invoke({
+                "user_message": first_user_message.message,
+                "bot_message": first_bot_message.message
+            })
+            # Assuming the chain returns a string directly or an object with a 'content' attribute
+            title = title_result.content if hasattr(title_result, 'content') else str(title_result)
+
+        except Exception as llm_err:
+            print(f"Error invoking title generation chain for {conversation_id}: {llm_err}")
+            return JsonResponse({"error": f"Failed to generate title via LLM: {llm_err}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        if title:
+            cleaned_title = title.strip().strip('"') # Clean up output
+            if cleaned_title:
+                conversation.conversation_title = cleaned_title[:255] # Truncate if needed
+                conversation.updated_at = timezone.now() # Update timestamp
+                conversation.save(update_fields=['conversation_title', 'updated_at'])
+                print(f"Generated/Updated title for {conversation_id}: {conversation.conversation_title}")
+                return JsonResponse({
+                    "status": "Title generated successfully",
+                    "conversation_id": conversation_id,
+                    # --- Use conversation_title ---
+                    "title": conversation.conversation_title
+                }, status=status.HTTP_200_OK)
+        else:
+            return JsonResponse({
+                "status": "Title generation returned no result.",
+                "conversation_id": conversation_id,
+            }, status=status.HTTP_200_OK) # Success, but no title generated
+
+    except Conversation.DoesNotExist:
+        return JsonResponse({"error": "Conversation not found"}, status=status.HTTP_404_NOT_FOUND)
+    except Exception as e:
+        print(f"Error in generate_conversation_title view for {conversation_id}: {e}\n{traceback.format_exc()}")
+        return JsonResponse({"error": f"An unexpected error occurred: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 @api_view(['GET'])
 def load_messages(request, conversation_id):
@@ -166,17 +236,22 @@ def load_messages(request, conversation_id):
         return JsonResponse({"error": "conversation_id parameter is required"}, status=400)
 
     try:
-        messages_queryset = Message.objects.select_related('role_id').filter(conversation_id=conversation_id).order_by('created_at')
+        # Fetch the conversation object itself to easily get the count later
+        conversation = Conversation.objects.get(conversation_id=conversation_id)
 
-        if not messages_queryset.exists():
-            # Return an empty list if no messages are found for the conversation
-            return JsonResponse([], safe=False, status=200)
+        # Fetch the messages related to this conversation
+        messages_queryset = Message.objects.select_related('role_id').filter(
+            conversation=conversation # Filter by conversation instance
+        ).order_by('created_at')
+
+        # Get the total count of messages for this conversation
+        message_count = messages_queryset.count() # Efficiently count the filtered messages
 
         # Serialize the queryset to a list of dictionaries
         messages_list = [
             {
                 "message_id": msg.message_id,
-                "conversation_id": str(msg.conversation_id),
+                "conversation_id": str(msg.conversation_id), # Use conversation_id from message instance
                 "sender": msg.sender,
                 "role_id": msg.role_id.role_id if msg.role_id else None,
                 "message": msg.message,
@@ -187,10 +262,20 @@ def load_messages(request, conversation_id):
             }
             for msg in messages_queryset
         ]
-        return JsonResponse(messages_list, safe=False, status=200)
-    except Message.DoesNotExist:
-        return JsonResponse({"error": "Messages not found for this conversation"}, status=404)
+
+        # --- Prepare the response payload including the count ---
+        response_data = {
+            "messages": messages_list,
+            "message_count": message_count
+        }
+
+        return JsonResponse(response_data, safe=False, status=200) # safe=False because top level is dict
+
+    except Conversation.DoesNotExist:
+         # Handle case where the conversation itself doesn't exist
+         return JsonResponse({"error": "Conversation not found"}, status=404)
     except Exception as e:
+        print(f"Error fetching messages or count for {conversation_id}: {e}") # Added print
         return JsonResponse({"error": f"Failed to fetch messages: {str(e)}"}, status=500)
 
 @api_view(['POST'])
@@ -383,101 +468,183 @@ def update_conversation_title(request, conversation_id):
 def chatbot(request):
     """
     /chatbot/respond/
-    Handle chatbot requests for a specific conversation
-        - conversation_id (required in request body)
-        - message (required in request body)
+    Handles user messages, generates SQL if needed, executes it,
+    analyzes results, and returns a response.
+    Handles SQL execution errors naturally.
+    Saves both user and bot messages.
     """
-    print("\n--- [DEBUG] Chatbot view received request ---") # DEBUG START
-    print(f"[DEBUG] Request Method: {request.method}") # DEBUG
-    print(f"[DEBUG] Request Headers: {request.headers}") # DEBUG - Check Content-Type here!
-    print(f"[DEBUG] Request Content-Type: {request.content_type}") # DEBUG - More specific
-    print(f"[DEBUG] Raw Request Body: {request.body}") # DEBUG - See the raw bytes
-
-    # --- Extract data from request body ---
     data = request.data
     user_input = data.get('message')
     conversation_id = data.get('conversation_id')
-    print(f"[DEBUG] Parsed Request Data: {request.data}") # DEBUG - See what DRF parsed
-    print(f"[DEBUG] Extracted conversation_id: {conversation_id}") # DEBUG
-    print(f"[DEBUG] Extracted user_input: '{user_input}'") # DEBUG
+    employee_id = data.get('employee_id')
 
-    # --- Validate input ---
-    if not user_input:
-        print("[DEBUG] Validation failed: 'message' field missing.") # DEBUG
-        return Response({"error": "JSON body must contain a 'message' field"}, status=status.HTTP_400_BAD_REQUEST)
-    if not conversation_id:
-        print("[DEBUG] Validation failed: 'conversation_id' field missing.") # DEBUG
-        return Response({"error": "JSON body must contain a 'conversation_id' field"}, status=status.HTTP_400_BAD_REQUEST)
+    if not user_input or not conversation_id or not employee_id:
+        return JsonResponse({"error": "Missing message, conversation_id, or employee_id"}, status=status.HTTP_400_BAD_REQUEST)
 
-    # --- Check if conversation exists ---
+    if not AGENT_CHAIN or not LLM_INSTANCE:
+        return JsonResponse({"error": "Chatbot agent not initialized."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
     try:
-        print(f"[DEBUG] Checking existence for conversation_id: {conversation_id}") # DEBUG
-        conversation = Conversation.objects.get(conversation_id=conversation_id)
-        print(f"[DEBUG] Conversation found: {conversation.conversation_id}") # DEBUG
-    except Conversation.DoesNotExist:
-        print(f"[DEBUG] Conversation not found for ID: {conversation_id}") # DEBUG
-        return Response({"error": "Conversation not found"}, status=status.HTTP_404_NOT_FOUND)
-    except ValueError: # Handle cases where the provided ID is not a valid UUID format
-        print(f"[DEBUG] Invalid conversation_id format: {conversation_id}") # DEBUG
-        return Response({"error": "Invalid conversation_id format"}, status=status.HTTP_400_BAD_REQUEST)
-    except Exception as e:
-        print(f"[DEBUG] Error checking conversation existence: {e}") # DEBUG
-        return Response({"error": f"Error verifying conversation: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        # --- 1. Fetch User with Role and Conversation ---
+        try:
+            # --- Use select_related to fetch the role object efficiently ---
+            user = User.objects.select_related('role').get(employee_id=employee_id)
+            conversation = Conversation.objects.get(conversation_id=conversation_id)
 
+            # --- Check if user has a role assigned ---
+            if not user.role:
+                print(f"Warning: User {employee_id} does not have a role assigned.")
+                user_role_instance = None
+            else:
+                user_role_instance = user.role # Get the RolePerm instance
 
-    # --- Process the request using the conversation_id from the body ---
-    try:
-        print(f"[DEBUG] Calling process_user_input for convo {conversation_id}...") # DEBUG
-        llm_response_json = process_user_input(user_input, conversation_id, AGENT_CHAIN) # Renamed for clarity
-        print(f"[DEBUG] Received json_response from LLM: {llm_response_json}") # DEBUG
+        except User.DoesNotExist:
+            return JsonResponse({"error": f"User with employee_id {employee_id} not found."}, status=status.HTTP_404_NOT_FOUND)
+        except Conversation.DoesNotExist:
+            return JsonResponse({"error": f"Conversation with id {conversation_id} not found."}, status=status.HTTP_404_NOT_FOUND)
+        except Exception as e:
+            print(f"Error fetching user or conversation: {e}\n{traceback.format_exc()}")
+            return JsonResponse({"error": f"Error accessing user/conversation data: {e}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-        # --- Store the initial response and potential query ---
-        final_response = {"response": llm_response_json.get("answer", "No answer generated.")}
-        sql_query = llm_response_json.get("sql_query")
-        # --- Add the sql_query to the final response *before* potential modification by analysis ---
-        final_response["sql_query"] = sql_query # Add query here
+        # --- 2. Save User Message ---
+        try:
+            user_message = Message.objects.create(
+                conversation=conversation,
+                sender='user',
+                message=user_input,
+                role_id=user_role_instance
+            )
+            print(f"User message {user_message.message_id} saved.")
+        except Exception as e:
+            print(f"Error saving user message: {e}\n{traceback.format_exc()}")
+            return JsonResponse({"error": f"Error saving user message: {e}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-        print(f"[DEBUG] Extracted SQL query from response: '{sql_query}'") # DEBUG
+        # --- 3. Process User Input with LLM (Intent, Initial Answer, SQL) ---
+        llm_response_data = process_user_input(user_input, conversation_id) # Pass only needed args
 
-        if sql_query and sql_query.strip() and sql_query.lower() != "none":
-            print(f"[DEBUG] SQL query found. Attempting execution...") # DEBUG
-            try:
-                print(f"[DEBUG] Calling execute_query with: {sql_query}") # DEBUG
-                result = execute_query(sql_query)
-                print(f"[DEBUG] Received result from execute_query: {result}") # DEBUG
+        if llm_response_data.get("intent") == "error":
+            return JsonResponse({"response": llm_response_data.get("answer", "An error occurred."), "sql_error": llm_response_data.get("answer")}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-                if result and "error" in result:
-                    print(f"[DEBUG] SQL execution error: {result['error']}") # DEBUG
-                    final_response["sql_error"] = f"Error executing generated SQL: {result['error']}"
-                    # Keep the original LLM answer in case of SQL error
-                elif result and result.get("headers") is not None and result.get("rows") is not None:
-                    print("[DEBUG] SQL execution successful. Adding data to response.") # DEBUG
-                    final_response["data"] = result
-                    if llm_response_json.get("intent") == "generate_sql":
-                        print("[DEBUG] Intent is 'generate_sql'. Calling analyze_sql_results...") # DEBUG
-                        analysis = analyze_sql_results(result, user_input, conversation_id, AGENT_CHAIN)
-                        print(f"[DEBUG] Received analysis from LLM: {analysis}") # DEBUG
-                        # --- Overwrite the 'response' field with the analysis ---
-                        final_response["response"] = analysis
-                    else:
-                        print("[DEBUG] Intent is not 'generate_sql', skipping analysis.") # DEBUG
+        intent = llm_response_data.get("intent")
+        initial_answer = llm_response_data.get("answer", "...") # Default answer
+        sql_query = llm_response_data.get("sql_query")
+
+        final_response_text = initial_answer
+        sql_results_data = None
+        sql_error_message = None
+        bot_message_type = 'text' # Default type
+
+        # --- 4. Execute SQL if applicable ---
+        if intent == "generate_sql" and sql_query:
+            print(f"Executing SQL for conversation {conversation_id}: {sql_query}")
+            sql_results = execute_query(sql_query)
+            technical_error = sql_results.get("error")
+
+            if technical_error:
+                # --- 4a. Handle SQL Execution Error ---
+                print(f"SQL Error for conversation {conversation_id}: {technical_error}")
+                sql_error_message = technical_error # Store technical error
+
+                try:
+                    error_explanation_prompt = f"""The user asked: '{user_input}'.
+                    I tried to run the SQL query: '{sql_query}'.
+                    However, it failed with the following database error: '{technical_error}'.
+
+                    Please explain this failure to the user in simple, natural language (1-2 sentences).
+                    Suggest they might need to rephrase their request or that there might be an issue with the query generation.
+                    Do not include the SQL query or the exact technical error details in your explanation itself.
+                    Respond only with the natural language explanation."""
+
+                    error_explanation_response = LLM_INSTANCE.invoke(error_explanation_prompt)
+                    final_response_text = error_explanation_response.content.strip() if hasattr(error_explanation_response, 'content') else str(error_explanation_response).strip()
+
+                except Exception as llm_err:
+                    print(f"Error getting LLM explanation for SQL error: {llm_err}")
+                    final_response_text = f"Sorry, I encountered an error trying to run the database query. Please check your request or try again."
+
+            else:
+                # --- 4b. Process Successful SQL Results ---
+                print(f"SQL executed successfully for conversation {conversation_id}.")
+                # Use analyze_sql_results or the initial answer
+                # If analyze_sql_results is desired:
+                analysis_answer = analyze_sql_results(sql_results, user_input, conversation_id)
+                final_response_text = analysis_answer
+
+                # If you just want the initial answer before the table:
+                # final_response_text = initial_answer # Already set
+
+                # Prepare data for frontend table display
+                if sql_results.get("rows"):
+                    sql_results_data = {
+                        "headers": sql_results.get("headers", []),
+                        "rows": sql_results.get("rows", [])
+                    }
+                    bot_message_type = 'table' # Mark as table type if rows exist
                 else:
-                    print("[DEBUG] SQL execution result format unexpected or empty.") # DEBUG
-                    # Keep the original LLM answer if SQL result is weird
-            except Exception as e:
-                print(f"[DEBUG] Unexpected error during SQL execution/analysis phase: {e}") # DEBUG
-                final_response["sql_error"] = f"Unexpected error during SQL execution: {str(e)}"
-                # Keep the original LLM answer
-        else:
-            print("[DEBUG] No valid SQL query found in LLM response.") # DEBUG
-            # Ensure sql_query in final_response remains None or the invalid value it had
+                    # If query ran but returned no rows, use the initial answer
+                    final_response_text = initial_answer + " (No matching data found)."
 
-        print(f"[DEBUG] Preparing final response: {final_response}") # DEBUG
-        # --- The final_response now includes 'response', 'sql_query' (if any), 'data' (if any), 'sql_error' (if any) ---
-        return Response(final_response, status=status.HTTP_200_OK)
+
+        # --- 5. Save Bot Message ---
+        try:
+            bot_message_content = final_response_text
+            db_sql_query_field = sql_query # Store original query by default
+
+            # --- Activate this block ---
+            if bot_message_type == 'table' and sql_results_data:
+                try:
+                    db_sql_query_field = f"[TABLE_DATA]:[{json.dumps(sql_results_data)}]"
+                    print(f"Storing table data in sql_query field for message.")
+                except Exception as json_err:
+                    print(f"Error serializing table data for storage: {json_err}")
+                    db_sql_query_field = sql_query
+
+            bot_message = Message.objects.create(
+                conversation=conversation,
+                sender='bot',
+                message=bot_message_content,
+                role_id=user_role_instance,
+                intent=intent,
+                sql_query=db_sql_query_field,
+                error=sql_error_message
+            )
+            print(f"Bot message {bot_message.message_id} saved.")
+            bot_message_id = bot_message.message_id
+        except Exception as e:
+            print(f"Error saving bot message: {e}\n{traceback.format_exc()}")
+            bot_message_id = None
+
+
+        # --- 5. Prepare and Return JsonResponse to Frontend ---
+        response_payload = {
+            "message_id": bot_message_id, # Include the saved bot message ID
+            "response": final_response_text,
+            "data": sql_results_data, # Contains headers/rows if successful query with results
+            "sql_query": sql_query, # The original SQL query attempted
+            "sql_error": sql_error_message, # Technical error message if execution failed
+            "intent": intent,
+            "type": bot_message_type # Let frontend know if it's text or table
+        }
+
+        # --- 6. Generate Title for New Conversations (Optional) ---
+        # Check if it's the first exchange (e.g., only 2 messages now)
+        if conversation.message_set.count() <= 2 and title_generation_chain:
+             try:
+                title = title_generation_chain.invoke({
+                    "user_message": user_input,
+                    "bot_message": final_response_text
+                })
+                if title:
+                    conversation.title = title[:255] # Truncate if needed
+                    conversation.save(update_fields=['title'])
+                    response_payload['conversation_title'] = conversation.title # Send updated title back
+                    print(f"Generated title for {conversation_id}: {title}")
+             except Exception as title_err:
+                print(f"Error generating title for {conversation_id}: {title_err}")
+
+
+        return JsonResponse(response_payload, status=status.HTTP_200_OK)
 
     except Exception as e:
-        print(f"[DEBUG] ERROR in main chatbot processing block for conversation {conversation_id}: {e}") # DEBUG
-        import traceback
-        traceback.print_exc()
-        return Response({"error": f"An unexpected error occurred: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        print(f"Unhandled error in chatbot view: {e}")
+        return JsonResponse({"error": f"An unexpected error occurred: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

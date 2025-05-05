@@ -803,11 +803,12 @@ def setup_langchain_agent():
             google_api_key=ai_config["api_key"],
             temperature=0.1
         )
-
+        
         # --- Prompt uses db_schema_subset which references the hardcoded dict ---
+        current_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         prompt = ChatPromptTemplate.from_template(
-            """You are an expert assistant for a database chatbot focused *only* on Financial and Accounting reports.
-            Current time is {current_time}.
+            f"""You are an expert assistant for a database chatbot focused *only* on Financial and Accounting reports.
+            Current time is {current_time}.""" + """
 
             You are provided with a subset of the database schema relevant *only* to Financial and Accounting tasks:
             Database Schema (Accounting & Finance Subset):
@@ -828,14 +829,25 @@ def setup_langchain_agent():
 
             Based on the user's input and previous conversation:
             1. Identify the intent:
-               - generate_sql: If the user asks for data or a report related *specifically* to the listed Financial & Accounting reports and the provided schema subset.
-               - database_insight: If the user asks a question about the *provided* Financial & Accounting schema or data concepts related to the listed reports.
+               - generate_sql: If the user asks for a *set* of data or a report (like the ones listed) that requires retrieving multiple rows/columns from the database using the provided schema subset. This intent usually implies the results will be displayed as a table. A request for a specific calculated value (like a count or sum) that requires a query also falls here, but the primary output should be the value in the 'answer' field.
+               - database_insight: If the user asks a question *about* the provided schema, data concepts, or asks for a simple summary/count that can be determined *directly* from the schema description or requires a very simple aggregation query (like COUNT(*)). The answer should be provided textually in the 'answer' field.
                - chitchat: Small talk like "hello there".
-               - out_of_scope: If the input asks about reports, data, or schema *outside* the listed Financial & Accounting domain (e.g., detailed Sales Orders, HR employee performance, specific Inventory movements not related to depreciation/assets). Politely state you can only handle Financial/Accounting reports listed above.
+               - out_of_scope: If the input asks about reports, data, or schema *outside* the listed Financial & Accounting domain. Politely state you can only handle Financial/Accounting reports listed above.
                - unrecognized: Input does not fall into any other category.
-            2. Provide a natural language answer in the "answer" field. If the intent is "out_of_scope", explain the limitation clearly.
-            3. If the intent is "generate_sql", include the generated SQL query (using *only* the provided schema subset) in the "sql_query" field. Otherwise, set "sql_query" to null.
+            2. Provide a natural language answer in the "answer" field.
+               - If the intent is "out_of_scope", explain the limitation clearly.
+               - If the intent is "database_insight", provide the answer or summary directly (e.g., "There are 5 columns in the chart_of_accounts table.", "The total count of accounts is 150.").
+               - If the intent is "generate_sql" and the request was for a specific value (like a count), state the value clearly in the answer (e.g., "There are 10 accounts matching that ID."). If the request was for a set of data, provide a brief introductory sentence (e.g., "Here are the accounts you requested.").
+               - Do NOT describe which specific tables or columns from the schema you are using in the "answer" field unless it's essential for explaining a limitation.
+            3. If the intent is "generate_sql", include the generated SQL query in the "sql_query" field.
+               - If the request was for a specific value (like a count) that required a query, include the aggregation query (e.g., SELECT COUNT(*) ...).
+               - If the request was for a set of data, include the query to retrieve that data.
+               - If the intent is "database_insight" and no query was needed (or only a trivial one implied by the schema description), set "sql_query" to null.
+               - Otherwise (for chitchat, out_of_scope, etc.), set "sql_query" to null.
             4. Return your response as a JSON object.
+
+            # --- Added Instruction ---
+            IMPORTANT: When explaining limitations (like missing data for a full report), provide the explanation in the "answer". If a partial SQL query is possible and relevant (like fetching account balances), include it in "sql_query". **Never ask the user if they want the SQL generated or ask follow-up clarifying questions about generating SQL. Just provide the explanation and the SQL if applicable.**
 
             Always respond in this JSON format:
             {{
@@ -857,26 +869,23 @@ def setup_langchain_agent():
         chain = (
             RunnablePassthrough.assign(
                 chat_history=lambda x: _load_chat_history_from_db(x.get('conversation_id'))["chat_history"],
-                current_time=lambda _: datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                # Directly use the hardcoded schema subset
                 db_schema_subset=lambda x: json.dumps(DB_SCHEMA_ACC_FINANCE, indent=2),
             )
             | prompt
             | llm
             | StrOutputParser()
         )
-        return chain
+        return chain, llm
     except Exception as e:
         print(f"CRITICAL Error initializing LangChain Agent Chain: {e}")
         return None
 
 
 # --- Initialize AGENT_CHAIN at module level ---
-AGENT_CHAIN = setup_langchain_agent()
-
+AGENT_CHAIN, LLM_INSTANCE = setup_langchain_agent()
 
 # --- process_user_input  ---
-def process_user_input(user_input, conversation_id, chain_instance):
+def process_user_input(user_input, conversation_id):
     if len(user_input) > MAX_INPUT_LENGTH:
         return {
             "intent": "error",
@@ -890,9 +899,9 @@ def process_user_input(user_input, conversation_id, chain_instance):
     }
 
     try:
-        if not chain_instance:
+        if not AGENT_CHAIN:
             raise ValueError("LangChain agent chain is not initialized.")
-        response = chain_instance.invoke(input_dict)
+        response = AGENT_CHAIN.invoke(input_dict)
         clean_text = (response.strip()
                 .removeprefix("'''json")
                 .removeprefix("```json")
@@ -916,7 +925,7 @@ def process_user_input(user_input, conversation_id, chain_instance):
 
 
 # --- analyze_sql_results ---
-def analyze_sql_results(results, user_input, conversation_id, chain_instance):
+def analyze_sql_results(results, user_input, conversation_id):
     formatted_results = json.dumps(results, default=str)
 
     analysis_prompt_text = f"""You are an assistant tasked with summarizing database query results into a *single, concise natural language sentence*.
@@ -940,9 +949,9 @@ def analyze_sql_results(results, user_input, conversation_id, chain_instance):
     }
 
     try:
-        if not chain_instance:
+        if not AGENT_CHAIN:
             raise ValueError("LangChain agent chain is not initialized.")
-        response = chain_instance.invoke(input_dict)
+        response = AGENT_CHAIN.invoke(input_dict)
         clean_text = (response.strip()
                     .removeprefix("```json")
                     .removeprefix("'''json")
@@ -965,12 +974,10 @@ def analyze_sql_results(results, user_input, conversation_id, chain_instance):
 # --- Title generation chain initialization ---
 def initialize_title_generation_chain():
     try:
-        ai_config = settings.AI_CONFIG['default']
-        llm = ChatGoogleGenerativeAI(
-            model=ai_config["model"],
-            google_api_key=ai_config["api_key"],
-            temperature=0.1
-        )
+        if not LLM_INSTANCE: # Check if LLM was initialized
+            print("CRITICAL Error initializing Title Chain: LLM_INSTANCE is None.")
+            return None
+
         title_prompt_template = ChatPromptTemplate.from_messages([
             ("system", "You are an assistant skilled at creating concise conversation titles."),
             ("human", """Based on the following initial exchange, generate a short, relevant title (max 10 words) for this conversation. Output only the title itself, nothing else.
@@ -981,7 +988,7 @@ Bot: "{bot_message}"
 Title:"""),
         ])
 
-        chain = title_prompt_template | llm | StrOutputParser()
+        chain = title_prompt_template | LLM_INSTANCE | StrOutputParser()
         return chain
 
     except Exception as e:

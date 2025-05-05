@@ -7,7 +7,8 @@ from .views import (
     create_message,
     chatbot,
     get_user_details,
-    update_conversation_title
+    update_conversation_title,
+    generate_conversation_title
 )
 
 urlpatterns = [
@@ -19,4 +20,5 @@ urlpatterns = [
     path('create_message/<str:conversation_id>/', create_message, name='create_message'),
     path('respond/', chatbot, name='chatbot_respond'),
     path('update_title/<str:conversation_id>/', update_conversation_title, name='update_conversation_title'),
+    path('generate_title/<str:conversation_id>/', generate_conversation_title, name='generate_conversation_title'),
 ]

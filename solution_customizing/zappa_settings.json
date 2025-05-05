@@ -30,7 +30,8 @@
             "DB_USER": "postgres",
             "DB_PASSWORD": "KntBg3jIY0DbpH8G9bwt",
             "DB_HOST": "kinetiq-postgresql.c30ww0i2ytkm.ap-southeast-1.rds.amazonaws.com",
-            "DB_PORT": "5432"
+            "DB_PORT": "5432",
+            "DJANGO_SECRET_KEY": "django-insecure-0un3katl4(j##n_b=qpmeg%_8q50f6gg7yypfe__k*u8fiq64z"
           }
     }
 }
