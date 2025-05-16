@@ -522,7 +522,7 @@ def chatbot(request):
             return JsonResponse({"error": f"Error saving user message: {e}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
         # --- 3. Process User Input with LLM (Intent, Initial Answer, SQL) ---
-        llm_response_data = process_user_input(user_input, conversation_id) # Pass only needed args
+        llm_response_data = process_user_input(user_input, conversation_id, employee_id) # Pass only needed args
 
         if llm_response_data.get("intent") == "error":
             return JsonResponse({"response": llm_response_data.get("answer", "An error occurred."), "sql_error": llm_response_data.get("answer")}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
@@ -572,19 +572,27 @@ def chatbot(request):
                 analysis_answer = analyze_sql_results(sql_results, user_input, conversation_id)
                 final_response_text = analysis_answer
 
-                # If you just want the initial answer before the table:
-                # final_response_text = initial_answer # Already set
+                headers = sql_results.get("headers", [])
+                rows = sql_results.get("rows", [])
 
-                # Prepare data for frontend table display
-                if sql_results.get("rows"):
+                if len(headers) <= 2 and len(rows) <= 2:
+                    # Add the marker to the SQL query
+                    sql_query = f"[no_rendertable]:{sql_query}"
+                    print(f"Added marker to SQL query: {sql_query}")
+                    bot_message_type = 'text'
+                else:
+                    # If rows exist and no marker is added, set bot_message_type to 'table'
+                    bot_message_type = 'table'
+
+                if rows:
                     sql_results_data = {
-                        "headers": sql_results.get("headers", []),
-                        "rows": sql_results.get("rows", [])
+                        "headers": headers,
+                        "rows": rows
                     }
-                    bot_message_type = 'table' # Mark as table type if rows exist
+                    
                 else:
                     # If query ran but returned no rows, use the initial answer
-                    final_response_text = initial_answer + " (No matching data found)."
+                    final_response_text = initial_answer
 
 
         # --- 5. Save Bot Message ---
@@ -592,14 +600,14 @@ def chatbot(request):
             bot_message_content = final_response_text
             db_sql_query_field = sql_query # Store original query by default
 
-            # --- Activate this block ---
-            if bot_message_type == 'table' and sql_results_data:
+            if sql_results_data:
                 try:
-                    db_sql_query_field = f"[TABLE_DATA]:[{json.dumps(sql_results_data)}]"
+                    db_sql_query_field += f"[TABLE_DATA]:[{json.dumps(sql_results_data)}]"
                     print(f"Storing table data in sql_query field for message.")
                 except Exception as json_err:
                     print(f"Error serializing table data for storage: {json_err}")
-                    db_sql_query_field = sql_query
+                    db_sql_query_field = sql_query  # Fallback to the original query
+
 
             bot_message = Message.objects.create(
                 conversation=conversation,
@@ -636,6 +644,8 @@ def chatbot(request):
                     "user_message": user_input,
                     "bot_message": final_response_text
                 })
+        
+
                 if title:
                     conversation.title = title[:255] # Truncate if needed
                     conversation.save(update_fields=['title'])
