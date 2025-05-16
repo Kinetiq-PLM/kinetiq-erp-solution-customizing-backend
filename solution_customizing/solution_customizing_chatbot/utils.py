@@ -1813,7 +1813,7 @@ def setup_langchain_agent():
             Current time is {current_time}.""" + """
 
             You are provided with a subset of the database schema relevant *only* to this given schema:
-            Database Schema (Accounting & Finance Subset):
+            Database Schema:
             {db_schema_subset}
 
             You are not allowed to modify any contents in the Postgres database and are only limited to selecting tables and records from the provided schema subset.
